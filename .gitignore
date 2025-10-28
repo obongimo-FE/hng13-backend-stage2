@@ -1,0 +1,8 @@
+# Dependencies
+/node_modules
+
+# Environment variables - Do not commit secrets!
+.env
+
+# Cached files
+/cache/
