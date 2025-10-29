@@ -101,7 +101,7 @@ A key feature is the ability to generate and serve a dynamic bar chart image sum
 - **Query Parameters**:
   - `region` (string): Filter countries by region (e.g., `?region=Africa`).
   - `currency` (string): Filter by currency code (e.g., `?currency=NGN`).
-  - `sort` (string): Sort results. Options: `name_asc`, `name_desc`, `gdp_asc`, `gdp_desc`.
+  - `sort` (string): Sort results. Currently supported option: `gdp_desc`.
 - **Example**: `http://localhost:3000/countries?region=Europe&sort=gdp_desc`
 
 #### `GET /countries/:name`

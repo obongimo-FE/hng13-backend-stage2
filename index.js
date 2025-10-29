@@ -45,17 +45,11 @@ app.get('/countries', async(req, res) => {
             filteredList = filteredList.filter(item => item.currency_code && item.currency_code.toLowerCase() === currency.toLowerCase())
         }
 
-        if (sort) {
-            if (sort === 'gdp_asc') {
-                filteredList.sort((a, b) => (a.estimated_gdp || 0) - (b.estimated_gdp || 0));
-            } else if (sort === 'gdp_desc') {
+        if (sort !== undefined){
+            if (sort === 'gdp_desc'){
                 filteredList.sort((a, b) => (b.estimated_gdp || 0) - (a.estimated_gdp || 0));
-            } else if (sort === 'name_asc') {
-                filteredList.sort((a, b) => a.name.localeCompare(b.name));
-            } else if (sort === 'name_desc') {
-                filteredList.sort((a, b) => b.name.localeCompare(a.name));
             } else {
-                return res.status(400).send({ message: 'Invalid sort parameter. Use gdp_asc, gdp_desc, name_asc, or name_desc.' });
+                res.status(400).send({ message: 'Invalid sort parameter. Use "desc" for descending order.'});
             }
         }
 
@@ -95,17 +89,20 @@ app.get('/status', async (req, res) => {
     });
 });
 
-app.get('/countries/:name', (req, res) => {
+app.get('/countries/:name', async (req, res) => {
     const countryName = req.params.name.toLowerCase();
-    const country = countries.find(c => c.name.toLowerCase() === countryName);
-    if (!country) {
+    const [country] = await db.query('SELECT * FROM countries WHERE LOWER(name) = ?', [countryName]);
+    if (!country.length) {
         return res.status(404).send({ message: 'Country not found' });
     }
-    res.json(country);
+    res.json(country[0]);
 });
 
 app.post('/countries/refresh', async (req, res) => {
+    const connection = await db.getConnection(); // Get a single connection for the transaction
     try {
+        await connection.beginTransaction();
+
         let countries, exchangeRates;
         const countriesAPI = 'https://restcountries.com/v2/all?fields=name,capital,region,population,flag,currencies';
         const ratesAPI = 'https://open.er-api.com/v6/latest/USD';
@@ -116,7 +113,7 @@ app.post('/countries/refresh', async (req, res) => {
                 axios.get(ratesAPI).catch(err => { throw { source: 'OpenExchangeRates', error: err }; })
             ]);
     
-            countries = countriesResponse.data;
+            countries = countriesResponse.data; // v2 data
             exchangeRates = ratesResponse.data.rates;
         } catch (apiError) {
             const source = apiError.source || 'Unknown API';
@@ -130,86 +127,74 @@ app.post('/countries/refresh', async (req, res) => {
             return res.status(status).send({ error: "External data source unavailable", details: `Could not fetch data from ${source}.`, underlyingError: message });
         }
 
-        //Check existing records
-        const [rows] = await getData();
-        
-        // Insert new data
-        const insertQuery = `
-            INSERT INTO countries
-            (name, capital, region, population, currency_code, exchange_rate, estimated_gdp, flag_url)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            `;
-
-        // Update Existing Data
-        const updateQuery = `
-                    UPDATE countries
-                    SET capital = ?, region = ?, population = ?, currency_code = ?, exchange_rate = ?, estimated_gdp = ?, flag_url = ?, last_refreshed_at = NOW()
-                    WHERE name = ?
-                `;
-
-
-        // Compute Country currencies code and match them
-        for (const country of countries) {
+        const countryData = countries.map(country => {
             let currencyCode = null;
-            if (country.currencies && country.currencies.length > 0) {
-                currencyCode = country.currencies[0].code;
-                console.log(currencyCode);
-                country.exchangeRateToUSD = exchangeRates[currencyCode] || null;
-            } else {
-                country.exchangeRateToUSD = null;
-                country.estimated_gdp = 0;
+            let exchangeRateToUSD = null;
+            let estimated_gdp = null;
+
+            if (country.currencies) {
+                const currency = country.currencies[0];
+                if (currency && currency.code) {
+                    currencyCode = currency.code;
+                    exchangeRateToUSD = exchangeRates[currencyCode] || null;
+                }
             }
 
-            // compute estimated gdp: estimated_gdp = population × random(1000–2000) ÷ exchange_rate
+            // Compute estimated gdp
             const randomFactor = Math.floor(Math.random() * (2000 - 1000 + 1)) + 1000;
-            if (country.exchangeRateToUSD) {
-                country.estimated_gdp = (country.population * randomFactor) / country.exchangeRateToUSD;
-            } else {
-                country.exchangeRateToUSD = null;
-                country.estimated_gdp = null;
+            if (exchangeRateToUSD) {
+                estimated_gdp = (country.population * randomFactor) / exchangeRateToUSD;
             }
 
-            // Store or update everything in MySQL as cached data.
-            if (rows.find(r => r.name.toLowerCase() === country.name.toLowerCase())) {
-                await db.query(updateQuery, [
-                    country.capital || null,
-                    country.region || null,
-                    country.population || null,
-                    currencyCode,
-                    country.exchangeRateToUSD,
-                    country.estimated_gdp,
-                    country.flag || null,
-                    country.name,
-                ]);
-            } else {
-                await db.query(insertQuery, [
-                    country.name,
-                    country.capital || null,
-                    country.region || null,
-                    country.population || null,
-                    currencyCode,
-                    country.exchangeRateToUSD,
-                    country.estimated_gdp,
-                    country.flag || null,
-                ]);        
-            }                
-        };
+            return [
+                country.name,
+                country.capital || null,
+                country.region || null,
+                country.population || null,
+                currencyCode,
+                exchangeRateToUSD,
+                estimated_gdp,
+                country.flag || null,
+            ];
+        });
+
+        const upsertSql = ` 
+            INSERT INTO countries (name, capital, region, population, currency_code, exchange_rate, estimated_gdp, flag_url)
+            VALUES ?
+            ON DUPLICATE KEY UPDATE
+                capital = VALUES(capital),
+                region = VALUES(region),
+                population = VALUES(population),
+                currency_code = VALUES(currency_code),
+                exchange_rate = VALUES(exchange_rate),
+                estimated_gdp = VALUES(estimated_gdp),
+                flag_url = VALUES(flag_url),
+                last_refreshed_at = NOW()
+        `;
+
+        await connection.query(upsertSql, [countryData]);
+
         global_last_refreshed_at = new Date().toISOString();
         await generateSummaryChart(db);
+        await connection.commit();
         res.status(201).send({ message: 'Countries refreshed and stored in database successfully.' });
     } catch (error) {
+        await connection.rollback();
         console.error('Error during database operation in /countries/refresh:', error.message);
         res.status(500).send({ message: 'An internal server error occurred during database processing.' });
+    } finally {
+        if (connection) connection.release();
     }
 });
 
-app.delete('/countries/:name', (req, res) => {
+app.delete('/countries/:name', async (req, res) => {
     const countryName = req.params.name.toLowerCase();
-    const countryIndex = countries.findIndex(c => c.name.toLowerCase() === countryName);
-    if (countryIndex === -1) {
+    const [country] = await db.query('SELECT * FROM countries WHERE LOWER(name) = ?', [countryName]);
+    if (!country.length) {
         return res.status(404).send({ message: 'Country not found' });
     }
-    countries.splice(countryIndex, 1);
+    await db.query('DELETE FROM countries WHERE LOWER(name) = ?', [countryName]);
+    
     res.status(204).send();
 });
 
